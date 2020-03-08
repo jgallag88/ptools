@@ -21,6 +21,7 @@ use std::alloc::System;
 static ALLOCATOR: System = System;
 
 extern crate getopts;
+extern crate goblin;
 extern crate nix;
 
 use getopts::{Options, ParsingStyle};
@@ -38,6 +39,10 @@ use std::path::Path;
 use std::str::from_utf8;
 use std::io::ErrorKind;
 use std::process::exit;
+
+use goblin::Object;
+use goblin::elf::program_header::PT_NOTE;
+use std::ops::Range;
 
 // Issues blocking 0.1 release
 //  - Everything marked with BLOCKER
@@ -104,7 +109,7 @@ fn print_args(pid: u64) {
     }
 }
 
-fn print_env(pid: u64) {
+fn print_env_live(pid: u64) {
     // This contains the environ as it was when the proc was started. To get the current
     // environment, we need to inspect its memory to find out how it has change. POSIX defines a
     // char **__environ symbol that we will need to find. Unfortunately, inspecting the memory of
@@ -818,6 +823,43 @@ fn print_files(pid: u64) {
     }
 }
 
+
+// https://refspecs.linuxbase.org/LSB_4.1.0/LSB-Core-generic/LSB-Core-generic/baselib---environ.html
+fn print_env_core(corefile: &str) {
+    let path = Path::new(corefile);
+    let buffer = fs::read(path).unwrap(); // TODO
+    let elf = if let Object::Elf(elf) = Object::parse(&buffer).unwrap() { // TODO
+        elf
+    } else {
+        eprint!("{} is not an ELF file", corefile);
+        exit(1); // TODO
+    };
+
+    println!("Succesfully parsed ELF?");
+
+    // TODO check that ELF has type core
+
+    // First, find the note which will let us know which libraries are mapped into this binary
+    let notes_section : Range<usize> = elf
+        .program_headers
+        .iter()
+        .find(|header| header.p_type == PT_NOTE)
+        .unwrap() // TODO
+        .file_range();
+
+    println!("Note range {:?}", notes_section);
+
+
+    println!("syms");
+    for sym in elf.syms.iter() {
+        println!("{}", sym.st_name);
+    }
+    println!("dynsyms");
+    for sym in elf.dynsyms.iter() {
+        println!("{}", sym.st_name);
+    }
+}
+
 pub fn pargs_main() {
     let args: Vec<String> = env::args().collect();
     let program = &args[0];
@@ -858,7 +900,7 @@ pub fn pargs_main() {
         }
 
         if do_print_env {
-            print_env(pid);
+            print_env_live(pid); // TODO what to do about this
         }
     }
 }
@@ -891,8 +933,11 @@ pub fn penv_main() {
     }
 
     for arg in &matches.free {
-        let pid = arg.parse::<u64>().unwrap();
-        print_env(pid);
+        if let Ok(pid) = arg.parse::<u64>() {
+            print_env_live(pid);
+        } else {
+            print_env_core(arg)
+        }
     }
 }
 
