@@ -23,6 +23,7 @@ static ALLOCATOR: System = System;
 extern crate getopts;
 extern crate goblin;
 extern crate nix;
+extern crate byteorder;
 
 use getopts::{Options, ParsingStyle};
 
@@ -33,7 +34,7 @@ use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Cursor};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::str::from_utf8;
@@ -41,8 +42,16 @@ use std::io::ErrorKind;
 use std::process::exit;
 
 use goblin::Object;
-use goblin::elf::program_header::PT_NOTE;
+use goblin::elf::program_header::{PT_NOTE, PT_LOAD};
+use goblin::elf::Elf;
 use std::ops::Range;
+use goblin::elf::note::NT_FILE;
+use goblin::elf::reloc::Reloc;
+
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use goblin::mach::header::filetype_to_str;
+use goblin::elf::sym::Sym;
+use goblin::elf::program_header::ProgramHeader;
 
 // Issues blocking 0.1 release
 //  - Everything marked with BLOCKER
@@ -823,10 +832,185 @@ fn print_files(pid: u64) {
     }
 }
 
+struct FileMapping<T> {
+    name: T,
+    start: u64,
+    _end: u64,
+    file_offset: u64,
+}
+
+fn parse_mappings(data: &[u8]) -> Vec<FileMapping<String>> {
+    let mut cursor = Cursor::new(data);
+
+    // TODO detect and use endianness of core
+    let count : u64 = cursor.read_u64::<LittleEndian>().unwrap(); // TODO
+    let page_size : u64 = cursor.read_u64::<LittleEndian>().unwrap(); // TODO
+
+    let mut mappings = vec![];
+    for _ in 0..count {
+        mappings.push(FileMapping {
+            name : (),
+            start : cursor.read_u64::<LittleEndian>().unwrap(), // TODO
+            _end : cursor.read_u64::<LittleEndian>().unwrap(), // TODO
+            file_offset : cursor.read_u64::<LittleEndian>().unwrap(), // TODO
+        });
+    }
+
+    mappings.iter_mut().map(|old| {
+        let mut name_buf = vec![];
+        cursor.read_until(b'\0', &mut name_buf).unwrap();
+        //let name_buf = name_buf[.. name_buf.len()-1];
+        name_buf.pop();
+        FileMapping {
+            name : String::from_utf8(name_buf).unwrap(),
+            start : old.start,
+            _end : old._end,
+            file_offset : old.file_offset,
+        }
+    }).collect()
+}
+
+fn align_section(offset: u64) -> u64 { // TODO rename me an my param
+    // TODO this function should accept the core architecture and select the page size using that.
+    let page_size = 4096;
+    return offset & !(page_size - 1);
+
+
+}
+
+// TODO rename me
+// TODO we could probably make this faster if we wanted by using the sym hash
+// __environ is a char**. The entry in the GOT is a pointer to __environ, and the relocation info contains
+// the address of the GOT entry for __environ, making the value returned here essentially a char****
+fn get_address_for_environ(mappings : &[FileMapping<String>], filename : &str) -> Option<u64> {
+    //print!("    ");
+    let path = Path::new(&filename);
+
+    let filestat = match stat(filename) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("skipping: {}", e);
+            return None;
+        }
+    };
+
+    // TODO do we need to do this, or will libgoblin do this for us?
+    let mode = filestat.st_mode & SFlag::S_IFMT.bits();
+    if SFlag::from_bits_truncate(mode) != SFlag::S_IFREG {
+        println!("skipping: not a regular file");
+        return None;
+    }
+
+    let buffer = fs::read(path).unwrap(); // TODO
+    let library = if let Object::Elf(elf) = Object::parse(&buffer).unwrap() { // TODO
+        elf
+    } else {
+        println!("skipping: not an ELF file");
+        return None;
+    };
+
+    if ! library.is_lib {
+        println!("skipping: not a library");
+    }
+
+    // TODO would be faster to look up using GNU_HASH
+    let reloc :Reloc = {
+        let mut reloc = None;
+        for r in library.dynrelas.iter() {
+            let sym = library.dynsyms.get(r.r_sym).unwrap();
+            let sym_name = library.dynstrtab.get(sym.st_name).unwrap().unwrap();
+            if sym_name == "__environ" {
+                reloc = Some(r);
+            }
+        }
+        match reloc {
+            Some(r) => r,
+            None => return None,
+        }
+    };
+
+    // Now we have the offset from the relocation, but to find the address of the entry in the GOT,
+    // we need to find the base address of the library, where depends on where it was mapped by the
+    // dynamic linker.
+
+    // Section by offset into the file, rounded down the nearest page (since that's where the mmap'ed)
+    // region will start.
+    let sections_by_file_offset : HashMap<u64, &ProgramHeader> =
+        library.program_headers
+            .iter().filter(|ph| ph.p_type == PT_LOAD)
+            .map(|ph| (align_section(ph.p_offset), ph))
+            .collect();
+
+    for (offset, section) in &sections_by_file_offset {
+        println!("0x{:x} -> 0x{:x} 0x{:x}", offset, section.p_offset, section.p_vaddr);
+    }
+
+    for mapping in mappings {
+        match sections_by_file_offset.get(&mapping.file_offset) {
+            None => continue,
+            Some(&ph) => {
+                if mapping.name.as_str() != filename {
+                    continue;
+                }
+                // base address of library
+                println!("  name: {}", mapping.name);
+                println!("  start: {:x}", mapping.start);
+                println!("  p_offset: {:x}", ph.p_offset);
+                println!("  p_vaddr: {:x}", ph.p_vaddr);
+                println!("  file_offset: {:x}", mapping.file_offset);
+                let base = mapping.start - (ph.p_vaddr - (ph.p_offset - mapping.file_offset));
+                return Some(base + reloc.r_offset);
+            }
+        }
+    }
+
+    None
+}
+
+// TODO This would be better as a function which takes a virtual address and returns value, handling
+// the translation and reading from the file internally.
+fn xlate_addr_to_core_offset(core: &Elf, addr: u64) -> Option<u64> {
+    // TODO have a range lookup data structure instead of looping
+    for ph in &core.program_headers {
+        if ph.p_type == PT_LOAD && ph.p_vaddr <= addr && ph.p_vaddr + ph.p_memsz > addr {
+            return Some(ph.p_offset + addr - ph.p_vaddr);
+        }
+    }
+
+    None
+}
+
+fn deref(core: &Elf, filebuf: &[u8], addr: u64) -> Option<u64> {
+    xlate_addr_to_core_offset(core, addr).map( |offset|
+                                                   // TODO should figure out endianness and pointer size from core ...
+        LittleEndian::read_u64(&filebuf[offset as usize ..]) // TODO, technically, we should be checking buffer is long enough
+    )
+}
+
+fn read_str(core: &Elf, filebuf: &[u8], addr: u64) -> Option<String> {
+    let strlen = {
+        let mut i = 0;
+        loop {
+            let offset = xlate_addr_to_core_offset(core, addr + i)?;
+            // TODO should figure out endianness and pointer size from core ...
+            // TODO, technically, we should be checking buffer is long enough
+            if filebuf[offset as usize] == 0 {
+                break i;
+            } else {
+                i += 1;
+            }
+        }
+    };
+    let offset = xlate_addr_to_core_offset(core, addr).unwrap() as usize;
+    Some(String::from_utf8_lossy(&filebuf[offset .. offset + strlen as usize]).to_string())
+}
+
+// TODO do we need to do anything special to handle prelinking??
 
 // https://refspecs.linuxbase.org/LSB_4.1.0/LSB-Core-generic/LSB-Core-generic/baselib---environ.html
 fn print_env_core(corefile: &str) {
     let path = Path::new(corefile);
+    // TODO don't read and parse whole file, just the parts we need. Core files can be very large.
     let buffer = fs::read(path).unwrap(); // TODO
     let elf = if let Object::Elf(elf) = Object::parse(&buffer).unwrap() { // TODO
         elf
@@ -835,9 +1019,14 @@ fn print_env_core(corefile: &str) {
         exit(1); // TODO
     };
 
-    println!("Succesfully parsed ELF?");
+    println!("Successfully parsed ELF?");
 
     // TODO check that ELF has type core
+
+    // TODO at some point, we need to look for symbol in static symbols of original binary, in case
+    // it is statically linked. But symbols might have been stripped, so we need to look for debug
+    // info, or debug link ...  If we can't find any reference to the __environ symbol, maybe we can
+    // just find the original environment placed on the stack? (is this what /proc/<pid>/env is doing?)
 
     // First, find the note which will let us know which libraries are mapped into this binary
     let notes_section : Range<usize> = elf
@@ -847,18 +1036,61 @@ fn print_env_core(corefile: &str) {
         .unwrap() // TODO
         .file_range();
 
-    println!("Note range {:?}", notes_section);
 
+    println!("Notes");
+    let nt_files =
+        elf.iter_note_headers(&buffer)
+            .and_then(|itr| itr.map(|note| note.unwrap()).find(|note| note.n_type == NT_FILE)) // TODO
+            .unwrap(); // TODO
 
-    println!("syms");
-    for sym in elf.syms.iter() {
-        println!("{}", sym.st_name);
-    }
-    println!("dynsyms");
-    for sym in elf.dynsyms.iter() {
-        println!("{}", sym.st_name);
+    let mappings = parse_mappings(nt_files.desc);
+
+    // TODO before we use one of these mappings, we should check the debug_id or whatever it is that
+    // we need to check to make sure that we have the correct version of the file. Otherwise, file
+    // could have change because it is being examined on a different system/container/whatever than
+    // the one where it was generated.
+
+    for mapping in &mappings {
+        // We should probably be looking through all of the linked libraries, rather than assuming the
+        // one we want is called 'libc' (though it's probably fine to look for and through one called
+        // 'libc-' first as an optimization). The problem is that other libraries also have dynsyms
+        // named __environ, I'm guessing because they want to link against that symbol, rather than
+        // because they provide that symbol. How can we tell which is which? Maybe st_info and/or
+        // st_visibility: https://docs.oracle.com/cd/E23824_01/html/819-0690/chapter6-79797.html#scrolltoc ?
+        if mapping.name.contains("/libc-") {
+            println!("  name: {}", mapping.name);
+            let base = mapping.start - mapping.file_offset;
+            let environ_pp : u64 = get_address_for_environ(&mappings , &mapping.name).unwrap();
+            println!("  &&__environ {:x}", environ_pp);
+            let environ_p = deref(&elf, &buffer, environ_pp).unwrap();
+            println!("  &__environ {:x}", environ_p);
+            let environ = deref(&elf, &buffer, environ_p).unwrap();
+            println!("  __environ {:x}", environ);
+
+            let mut str_pp = environ;
+            loop {
+                let str_p = deref(&elf, &buffer, str_pp).unwrap();
+                if (str_p == 0) {
+                    break;
+                }
+                let s = read_str(&elf, &buffer, str_p).unwrap();
+                println!("{}", s);
+                str_pp += 8; // TODO should be arch specific
+            }
+            break;
+        }
     }
 }
+
+/*
+ * pargs core notes: values from core are not necessarily the same as those given to the process
+   initially. We get them off of initial threads stack, where they were placed by the kernel when it
+   started the process. However they could have been modified unintentionally, or intentionally (e.g.
+   getopt in glibc I think).
+
+   The values you get are typically (but not necessarily) the same as those you get from /proc/pid/cmdline
+   (what you get from /proc/pid/cmdline can be affected by PR_SET_MM_ARG_START and such)
+ */
 
 pub fn pargs_main() {
     let args: Vec<String> = env::args().collect();

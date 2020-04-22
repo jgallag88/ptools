@@ -1,0 +1,6 @@
+__environ offset (in libc):  0x3eaea8
+libc base:                   0x7f8fa8c0d000
+
+- find a LOAD section where p_offset rounded down to page size equals offset of region as listed in NT_NOTE
+- base = start address of region in NT_NOTE - (p_vaddr - (p_offset - offset from note))
+                             
