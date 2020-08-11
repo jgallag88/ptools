@@ -12,5 +12,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-      - name: Print something
-        run: echo "Hello from ${{ github.ref }}"
+      - name: Check version
+        # Cargo requires that Cargo.toml contain a version, and that version is
+        # used by cargo-deb to build the package. Make sure that the version has
+        # been bumped to match the new tag.
+        run: |
+          gh_tag=$(echo "${{ github.ref }}")
+          version=${gh_tag#refs/tags/v}
+          echo "Working with version $version"
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
